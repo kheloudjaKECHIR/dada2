@@ -1,0 +1,210 @@
+---
+title: "R Notebook"
+output: github_document
+---
+
+```{r}
+# Charger le package DADA2
+# Le packageVersion permet de vérifier la version de dada2 installée.
+ library(dada2); packageVersion("dada2")
+```
+
+```{r}
+# Définir le chemin vers le répertoire contenant les fichiers fastq
+# Modifie ce chemin pour qu'il pointe vers le dossier contenant tes données après extraction.
+path <- "~/MiSeq_SOP"  # Remplace "~/MiSeq_SOP" par le chemin correct vers tes fichiers fastq.
+```
+
+```{r}
+list.files(path)  # Liste tous les fichiers dans le répertoire pour vérifier qu'ils sont bien détectés.
+```
+
+```{r}
+# Obtenir les noms des fichiers fastq pour les reads forward (R1) et reverse (R2)
+# Utilisation de la fonction list.files() pour lister les fichiers et extraction par motif ("_R1_001.fastq" pour forward).
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))  # Fichiers forward
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))  # Fichiers reverse
+```
+
+```{r}
+# Extraire les noms des échantillons à partir des noms de fichiers
+# On suppose que les noms des fichiers sont de la forme : "SAMPLENAME_XXX.fastq".
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+```{r}
+# Visualiser les profils de qualité des lectures
+# plotQualityProfile permet de voir la qualité de séquençage sur les premiers fichiers forward.
+plotQualityProfile(fnFs[1:2])  # Visualiser la qualité des deux premiers fichiers forward
+plotQualityProfile(fnRs[1:2])  # Visualiser la qualité des deux premiers fichiers reverse
+```
+
+```{r}
+# Définir les chemins pour les fichiers fastq filtrés
+# On crée un dossier "filtered" dans le répertoire de travail pour stocker les fichiers filtrés.
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+```{r}
+# Filtrage et trimming des séquences
+# La fonction filterAndTrim filtre les séquences en fonction des paramètres définis comme truncLen et maxEE.
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     truncLen=c(240,160),  # Longueur de troncature pour les lectures forward et reverse.
+                     maxN=0,  # Aucun 'N' n'est autorisé dans les séquences.
+                     maxEE=c(2,2),  # Maximum d'erreurs attendues autorisées par lecture.
+                     truncQ=2,  # Troncature sur la base de la qualité.
+                     rm.phix=TRUE,  # Supprimer les séquences PhiX, un contaminant courant.
+                     compress=TRUE,  # Comprimer les fichiers de sortie.
+                     multithread=TRUE)  # Utiliser plusieurs cœurs pour accélérer le traitement.
+head(out)  # Afficher les premières lignes du résultat pour voir combien de séquences ont été filtrées.
+```
+
+```{r}
+# Apprendre les taux d'erreur à partir des séquences filtrées
+# La fonction learnErrors apprend le modèle d'erreur à partir des lectures filtrées.
+errF <- learnErrors(filtFs, multithread=TRUE)  # Modèle d'erreur pour les lectures forward
+errR <- learnErrors(filtRs, multithread=TRUE)  # Modèle d'erreur pour les lectures reverse
+```
+
+```{r}
+# Visualiser les taux d'erreur estimés
+plotErrors(errF, nominalQ=TRUE)  # Visualisation des erreurs des lectures forward
+plotErrors(errR, nominalQ=TRUE)  # Visualisation des erreurs des lectures reverse
+```
+
+```{r}
+# Inférence des échantillons à partir des séquences filtrées
+# On applique l'algorithme DADA2 pour identifier les variants de séquences.
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)  # Inférence des lectures forward
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)  # Inférence des lectures reverse
+```
+
+```{r}
+# Vérification de l'objet dada pour les lectures forward
+# Cet objet contient des informations sur les variants de séquences trouvés.
+dadaFs[[1]]
+```
+
+```{r}
+# Fusionner les lectures forward et reverse
+# La fonction mergePairs fusionne les lectures forward et reverse pour obtenir les séquences complètes.
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+head(mergers[[1]])  # Afficher les premières lignes du résultat de fusion pour le premier échantillon
+```
+
+```{r}
+# Construire la table des séquences
+# Création de la table des variants de séquences (ASV table).
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)  # Afficher la dimension de la table (échantillons x variants de séquences)
+```
+
+```{r}
+# Inspecter la longueur des séquences pour détecter d'éventuelles séquences anormales
+table(nchar(getSequences(seqtab)))
+```
+
+```{r}
+# Supprimer les chimères de la table de séquences
+# Les chimères sont des artefacts de PCR qui apparaissent comme des séquences erronées.
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)  # Afficher la nouvelle dimension après suppression des chimères
+sum(seqtab.nochim)/sum(seqtab)  # Calculer la proportion de séquences restantes
+```
+
+```{r}
+# Suivre l'évolution du nombre de lectures à travers le pipeline
+getN <- function(x) sum(getUniques(x))  # Fonction pour obtenir le nombre de séquences uniques
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)  # Afficher les premières lignes du tableau de suivi
+```
+
+```{r}
+# Créer le répertoire "tax" dans ton répertoire personnel (home) s'il n'existe pas
+if (!dir.exists("~/tax")) dir.create("~/tax")
+
+# Télécharger le fichier Silva v132 dans le répertoire "tax"
+download.file("https://zenodo.org/record/1172783/files/silva_nr_v132_train_set.fa.gz", 
+              destfile = "~/tax/silva_nr_v132_train_set.fa.gz", method = "auto")
+
+# Vérifier que le fichier a été correctement téléchargé
+file.exists("~/tax/silva_nr_v132_train_set.fa.gz")
+```
+
+```{r}
+# Assigner la taxonomie
+# La fonction assignTaxonomy assigne la taxonomie aux séquences selon une base de données de référence.
+taxa <- assignTaxonomy(seqtab.nochim, "~/tax/silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+```
+
+```{r}
+# Inspection des assignations taxonomiques
+taxa.print <- taxa  # Copier la matrice pour l'inspection
+rownames(taxa.print) <- NULL  # Retirer les noms de lignes pour un affichage plus clair
+head(taxa.print)  # Afficher les premières lignes des assignations taxonomiques
+```
+
+```{r}
+# Évaluation de la précision avec un échantillon témoin (mock)
+unqs.mock <- seqtab.nochim["Mock",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE)
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+```
+
+```{r}
+# Visualisation avec le package phyloseq
+# Importer les résultats DADA2 dans phyloseq pour d'autres analyses.
+library(phyloseq)
+samples.out <- rownames(seqtab.nochim)
+subject <- sapply(strsplit(samples.out, "D"), `[`, 1)
+gender <- substr(subject, 1, 1)
+subject <- substr(subject, 2, 999)
+day <- as.integer(sapply(strsplit(samples.out, "D"), `[`, 2))
+samdf <- data.frame(Subject=subject, Gender=gender, Day=day)
+samdf$When <- "Early"
+samdf$When[samdf$Day>100] <- "Late"
+rownames(samdf) <- samples.out
+```
+
+```{r}
+# Créer un objet phyloseq avec la table des séquences, la taxonomie et les données de l'échantillon
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf), 
+               tax_table(taxa))
+ps <- prune_samples(sample_names(ps) != "Mock", ps)  # Retirer les échantillons Mock pour l'analyse
+```
+
+```{r}
+# Visualisation de la richesse alpha (diversité alpha)
+plot_richness(ps, x="Day", measures=c("Shannon", "Simpson"), color="When")
+```
+
+```{r}
+# Ordination NMDS sur les distances de Bray-Curtis
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+plot_ordination(ps.prop, ord.nmds.bray, color="When", title="Bray NMDS")
+```
+
+```{r}
+library(phyloseq)
+library(ggplot2)
+```
+
+```{r}
+# Barplot de la composition taxonomique
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="Day", fill="Family") + facet_wrap(~When, scales="free_x")
+```
+
+
